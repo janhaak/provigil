@@ -1,0 +1,8 @@
+# provigil targets bash 3.2 — the /bin/bash that ships with macOS. Do not
+# introduce bash 4+ constructs (associative arrays, ${var,,}, mapfile/readarray,
+# namerefs); the script has deliberate 3.2 workarounds in push_hist,
+# rate_per_min and trend_arrow.
+shell=bash
+
+# Follow sourced files only when they are given as literal paths.
+external-sources=false

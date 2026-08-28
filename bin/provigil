@@ -1,0 +1,499 @@
+#!/bin/bash
+# provigil
+#   default: lid-closed, off-charger, online (system stays up; display can sleep)
+#   max:     lid open, keep display on and screensaver disabled
+# Auto-exits on low battery or high temperature.
+
+MODE="${1:-default}"
+case "$MODE" in
+  default|max) ;;
+  *) echo "Usage: $0 [default|max]" >&2; exit 1 ;;
+esac
+
+# Tunables. Defaults are unchanged from the original; each can be overridden by
+# the matching PROVIGIL_* environment variable.
+MIN_BATTERY="${PROVIGIL_MIN_BATTERY:-10}"      # percent — exit at or below
+WARN_TEMP_C="${PROVIGIL_WARN_TEMP_C:-40}"      # °C — warn at or above
+MAX_TEMP_C="${PROVIGIL_MAX_TEMP_C:-45}"        # °C — exit at or above
+POLL_SECONDS="${PROVIGIL_POLL_SECONDS:-30}"    # seconds between samples
+HIST_MAX="${PROVIGIL_HIST_MAX:-50}"            # samples kept for sparklines (~25 min at 30s poll)
+SPARK_HEIGHT="${PROVIGIL_SPARK_HEIGHT:-6}"     # rows tall — taller = more visible slope/gradient
+LOCK=/tmp/provigil.pid
+
+SAVER_ORIG=""
+CAFF_PID=""
+EXIT_CODE=0
+NARROW=0
+BOX_W=80
+
+# --- Lockfile ---------------------------------------------------------------
+if [[ -f "$LOCK" ]] && kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
+  echo "provigil already running (pid $(cat "$LOCK"))" >&2
+  exit 1
+fi
+echo $$ > "$LOCK"
+
+# --- Fail-fast sudo check ---------------------------------------------------
+if ! sudo -n pmset -g >/dev/null 2>&1; then
+  echo "Error: passwordless pmset not configured (need /etc/sudoers.d/pmset-nopasswd)" >&2
+  rm -f "$LOCK"
+  exit 1
+fi
+
+# --- Cleanup ----------------------------------------------------------------
+cleanup() {
+  tput cnorm 2>/dev/null
+  tput sgr0 2>/dev/null
+  printf "\n"
+  if [[ -n "$CAFF_PID" ]]; then kill "$CAFF_PID" 2>/dev/null; fi
+  sudo -n pmset -a disablesleep 0 >/dev/null 2>&1
+  if [[ "$MODE" == "max" && -n "$SAVER_ORIG" ]]; then
+    defaults -currentHost write com.apple.screensaver idleTime -int "$SAVER_ORIG"
+  fi
+  rm -f "$LOCK"
+  exit "${EXIT_CODE:-0}"
+}
+trap cleanup INT TERM EXIT
+
+# --- Readers ----------------------------------------------------------------
+read_battery_pct() {
+  ioreg -r -n AppleSmartBattery | awk -F'= ' '/"CurrentCapacity"/ {print $2; exit}'
+}
+
+read_temp_c() {
+  # AppleSmartBattery exposes two temps in centi-Celsius:
+  #   Temperature        = cell temp (e.g. 3128 = 31.28°C)
+  #   VirtualTemperature = effective temp used by Apple for thermal decisions
+  #                        (e.g. 3959 = 39.59°C, matches what Stats shows as "Battery")
+  # Report the max so either sensor going hot trips the threshold.
+  ioreg -r -n AppleSmartBattery | awk '
+    /"Temperature" = / { split($0,a,"= "); t=a[2]+0 }
+    /"VirtualTemperature" = / { split($0,a,"= "); v=a[2]+0 }
+    END { m=(v>t)?v:t; printf "%.1f\n", m/100 }
+  '
+}
+
+read_power_source() {
+  pmset -g batt | awk -F"'" '/Now drawing/ {sub(/ *Power$/, "", $2); print $2; exit}'
+}
+
+read_load_avg() {
+  uptime | awk -F'load averages?:' '{print $2}' | sed -E 's/^ +//; s/,//g'
+}
+
+read_pmset_eta() {
+  # macOS smoothed estimate like "2:34 remaining"
+  pmset -g batt | awk '/remaining/ {for(i=1;i<=NF;i++) if($i ~ /^[0-9]+:[0-9]+$/) {print $i; exit}}'
+}
+
+# --- Notify -----------------------------------------------------------------
+notify() {  # title message
+  osascript -e "display notification \"$2\" with title \"$1\"" >/dev/null 2>&1 || true
+}
+
+# --- Sparkline --------------------------------------------------------------
+SPARK=(' ' '▁' '▂' '▃' '▄' '▅' '▆' '▇' '█')
+sparkline() {  # lo hi v1 v2 v3 ...
+  local lo=$1 hi=$2; shift 2
+  local out="" v idx
+  for v in "$@"; do
+    idx=$(awk -v v="$v" -v lo="$lo" -v hi="$hi" 'BEGIN{
+      r=hi-lo; if(r==0){print 4; exit}
+      i=int((v-lo)/r*8); if(i<0)i=0; if(i>8)i=8; print i }')
+    out+="${SPARK[$idx]}"
+  done
+  printf '%s' "$out"
+}
+
+# Multi-row sparkline: returns SPARK_HEIGHT lines (top → bottom), one per row.
+# Each column is a stack of full blocks topped with a partial block; total
+# height of each column scales the value into [0, SPARK_HEIGHT*8] sub-steps.
+multi_sparkline() {  # lo hi v1 v2 v3 ...
+  local lo=$1 hi=$2; shift 2
+  # Compute step values (0..H*8) in one awk pass.
+  local steps_raw
+  steps_raw=$(printf '%s\n' "$@" | awk -v lo="$lo" -v hi="$hi" -v h="$SPARK_HEIGHT" '
+    { r=hi-lo
+      if(r<=0){print int(h*4); next}
+      x=int(($1-lo)/r*h*8)
+      if(x<0)x=0; if(x>h*8)x=h*8
+      print x }')
+  local -a steps=()
+  local line
+  while IFS= read -r line; do steps+=("$line"); done <<< "$steps_raw"
+
+  local j s in_row row_str=""
+  for ((j=SPARK_HEIGHT-1; j>=0; j--)); do
+    row_str=""
+    for s in "${steps[@]}"; do
+      in_row=$((s - j*8))
+      if (( in_row <= 0 )); then row_str+=' '
+      elif (( in_row >= 8 )); then row_str+='█'
+      else row_str+="${SPARK[$in_row]}"
+      fi
+    done
+    printf '%s\n' "$row_str"
+  done
+}
+
+# --- Gauge ------------------------------------------------------------------
+gauge() {  # value max width
+  local v=$1 m=$2 w=$3
+  local cells full half empty
+  cells=$(awk -v v="$v" -v m="$m" -v w="$w" 'BEGIN{c=v/m*w*2; if(c<0)c=0; if(c>w*2)c=w*2; printf "%d", c}')
+  full=$((cells / 2))
+  half=$((cells % 2))
+  empty=$((w - full - half))
+  printf '['
+  (( full > 0 )) && printf '█%.0s' $(seq 1 "$full")
+  (( half )) && printf '▌'
+  (( empty > 0 )) && printf '░%.0s' $(seq 1 "$empty")
+  printf ']'
+}
+
+# --- Trend arrow from last 3 samples ---------------------------------------
+# Pass last 3 values directly to avoid bash 3.2 nameref limitations.
+trend_arrow() {  # a b c  (older to newer)
+  if (( $# < 3 )); then printf '→'; return; fi
+  local a=$1 b=$2 c=$3
+  if awk -v a="$a" -v b="$b" -v c="$c" 'BEGIN{exit !(c>b && b>a)}'; then printf '↑'
+  elif awk -v a="$a" -v b="$b" -v c="$c" 'BEGIN{exit !(c<b && b<a)}'; then printf '↓'
+  else printf '→'
+  fi
+}
+
+# --- Rate calc over last N seconds -----------------------------------------
+# Indirect array access for bash 3.2 compatibility.
+rate_per_min() {  # vals_name times_name window_seconds
+  local vname=$1 tname=$2 window=$3
+  local vref="${vname}[@]" tref="${tname}[@]"
+  local vals=("${!vref}") times=("${!tref}")
+  local n=${#vals[@]}
+  (( n < 2 )) && { printf '0'; return; }
+  local now=${times[n-1]} v_now=${vals[n-1]}
+  local i v0="" t0=""
+  for ((i=n-1; i>=0; i--)); do
+    if (( now - times[i] >= window )); then
+      v0=${vals[i]}; t0=${times[i]}; break
+    fi
+  done
+  if [[ -z "$t0" ]]; then v0=${vals[0]}; t0=${times[0]}; fi
+  awk -v vn="$v_now" -v v0="$v0" -v tn="$now" -v t0="$t0" 'BEGIN{
+    dt=(tn-t0)/60; if(dt<=0){print "0"; exit}
+    printf "%.2f", (vn-v0)/dt
+  }'
+}
+
+# --- Color helpers ----------------------------------------------------------
+c_green=$(tput setaf 2 2>/dev/null || true)
+c_yellow=$(tput setaf 3 2>/dev/null || true)
+c_red=$(tput setaf 1 2>/dev/null || true)
+c_dim=$(tput dim 2>/dev/null || true)
+c_bold=$(tput bold 2>/dev/null || true)
+c_reset=$(tput sgr0 2>/dev/null || true)
+
+batt_color() {
+  local b=$1
+  if (( b <= MIN_BATTERY )); then printf '%s' "$c_red"
+  elif (( b < 40 )); then printf '%s' "$c_yellow"
+  else printf '%s' "$c_green"; fi
+}
+temp_color() {
+  local t=$1
+  if awk -v t="$t" -v m="$MAX_TEMP_C" 'BEGIN{exit !(t>=m)}'; then printf '%s' "$c_red"
+  elif awk -v t="$t" -v w="$WARN_TEMP_C" 'BEGIN{exit !(t>=w)}'; then printf '%s' "$c_yellow"
+  else printf '%s' "$c_green"; fi
+}
+
+# --- Format helpers ---------------------------------------------------------
+fmt_uptime() {  # seconds
+  local s=$1
+  printf '%dh %dm %ds' $((s/3600)) $(((s%3600)/60)) $((s%60))
+}
+fmt_eta_hours() {  # hours (float)
+  awk -v h="$1" 'BEGIN{
+    if(h<0||h!=h){print "—"; exit}
+    H=int(h); M=int((h-H)*60)
+    if(H>=99){print "99h+"; exit}
+    printf "%dh %dm", H, M
+  }'
+}
+fmt_eta_minutes() {  # minutes (float)
+  awk -v m="$1" 'BEGIN{
+    if(m<0||m!=m){print "—"; exit}
+    if(m<1){print "<1m"; exit}
+    if(m>=60){H=int(m/60); printf "%dh %dm", H, int(m-H*60); exit}
+    printf "%dm", int(m+0.5)
+  }'
+}
+
+# --- Activate awake mode ----------------------------------------------------
+sudo -n pmset -a disablesleep 1 >/dev/null
+
+if [[ "$MODE" == "max" ]]; then
+  caffeinate -dims &
+  CAFF_PID=$!
+  SAVER_ORIG="$(defaults -currentHost read com.apple.screensaver idleTime 2>/dev/null || echo 300)"
+  defaults -currentHost write com.apple.screensaver idleTime -int 0
+else
+  caffeinate -ims &
+  CAFF_PID=$!
+fi
+
+# --- Histories --------------------------------------------------------------
+BATT_HIST=()
+TEMP_HIST=()
+# shellcheck disable=SC2034  # read indirectly by rate_per_min (passed by name)
+TIME_HIST=()
+START_TS=$(date +%s)
+
+push_hist() {  # arr_name value (bash 3.2-safe via eval)
+  # shellcheck disable=SC2034  # val is expanded inside the eval string below
+  local name=$1 val=$2 len
+  eval "${name}+=(\"\$val\")"
+  eval "len=\${#${name}[@]}"
+  while (( len > HIST_MAX )); do
+    eval "${name}=(\"\${${name}[@]:1}\")"
+    eval "len=\${#${name}[@]}"
+  done
+}
+
+# --- Render -----------------------------------------------------------------
+render_narrow() {
+  local batt=$1 temp=$2 power=$3 up=$4
+  local bc tc
+  bc=$(batt_color "$batt"); tc=$(temp_color "$temp")
+  printf '\r%s[provigil:%s]%s  batt %s%s%%%s  temp %s%s°C%s  %s  up %s%s' \
+    "$c_dim" "$MODE" "$c_reset" \
+    "$bc" "$batt" "$c_reset" \
+    "$tc" "$temp" "$c_reset" \
+    "$power" "$(fmt_uptime "$up")" "$c_reset"
+  tput el 2>/dev/null
+}
+
+render_box() {
+  local batt=$1 temp=$2 power=$3 up=$4
+  local bc tc batt_eta_str temp_cap_str drain_str rate_str
+  local batt_trend temp_trend batt_gauge temp_gauge
+  local power_str load_str warn_suffix=""
+
+  bc=$(batt_color "$batt")
+  tc=$(temp_color "$temp")
+  batt_trend=$(trend_arrow "${BATT_HIST[@]: -3}")
+  temp_trend=$(trend_arrow "${TEMP_HIST[@]: -3}")
+  batt_gauge=$(gauge "$batt" 100 20)
+  # Temp gauge anchored to MAX so the meter has meaning
+  temp_gauge=$(gauge "$temp" "$MAX_TEMP_C" 20)
+  # Multi-row sparklines (taller = more visible gradient).
+  local batt_spark_block temp_spark_block
+  batt_spark_block=$(multi_sparkline 0 100 "${BATT_HIST[@]}")
+  # Temp sparkline: dynamic min/max of recent samples, with a small floor so
+  # tiny variations don't fill the chart.
+  local tmin tmax
+  if (( ${#TEMP_HIST[@]} > 0 )); then
+    tmin=$(printf '%s\n' "${TEMP_HIST[@]}" | sort -n | head -1)
+    tmax=$(printf '%s\n' "${TEMP_HIST[@]}" | sort -n | tail -1)
+    # Ensure at least a 2°C range so flat readings render as flat, not full-scale.
+    local trange
+    trange=$(awk -v a="$tmin" -v b="$tmax" 'BEGIN{printf "%.2f", b-a}')
+    if awk -v r="$trange" 'BEGIN{exit !(r<2.0)}'; then
+      local mid
+      mid=$(awk -v a="$tmin" -v b="$tmax" 'BEGIN{printf "%.2f", (a+b)/2}')
+      tmin=$(awk -v m="$mid" 'BEGIN{printf "%.2f", m-1}')
+      tmax=$(awk -v m="$mid" 'BEGIN{printf "%.2f", m+1}')
+    fi
+  else
+    tmin=$temp; tmax=$temp
+  fi
+  temp_spark_block=$(multi_sparkline "$tmin" "$tmax" "${TEMP_HIST[@]}")
+
+  # Drain rate (negative = draining); ETA from pmset if available, else compute
+  drain_str="—"
+  batt_eta_str="—"
+  if [[ "$power" == AC* ]]; then
+    drain_str="charging"
+    batt_eta_str="—"
+  else
+    local rate
+    rate=$(rate_per_min BATT_HIST TIME_HIST 300)  # %/min over last 5m
+    # Convert to %/hr and ETA
+    local pct_per_hr
+    pct_per_hr=$(awk -v r="$rate" 'BEGIN{printf "%.1f", -r*60}')
+    if awk -v r="$rate" 'BEGIN{exit !(r<-0.01)}'; then
+      drain_str="${pct_per_hr}%/hr"
+      local pmset_eta
+      pmset_eta=$(read_pmset_eta)
+      if [[ -n "$pmset_eta" ]]; then
+        batt_eta_str="$pmset_eta"
+      else
+        local hrs
+        hrs=$(awk -v b="$batt" -v m="$MIN_BATTERY" -v p="$pct_per_hr" 'BEGIN{
+          if(p<=0){print -1; exit} printf "%.3f", (b-m)/p }')
+        batt_eta_str=$(fmt_eta_hours "$hrs")
+      fi
+    else
+      drain_str="0%/hr"
+    fi
+  fi
+
+  # Temp rate (°C/min over last 3 min) and cap-ETA
+  rate_str="0.0°C/min"
+  temp_cap_str="—"
+  if (( ${#TEMP_HIST[@]} >= 2 )); then
+    local trate
+    trate=$(rate_per_min TEMP_HIST TIME_HIST 180)
+    rate_str=$(awk -v r="$trate" 'BEGIN{
+      sign=(r>=0)?"+":""
+      printf "%s%.1f°C/min", sign, r
+    }')
+    if awk -v r="$trate" 'BEGIN{exit !(r>0.05)}'; then
+      local mins
+      mins=$(awk -v t="$temp" -v m="$MAX_TEMP_C" -v r="$trate" 'BEGIN{printf "%.2f", (m-t)/r}')
+      temp_cap_str=$(fmt_eta_minutes "$mins")
+      if awk -v m="$mins" 'BEGIN{exit !(m<15)}'; then warn_suffix=" ⚠"; fi
+    elif awk -v r="$trate" 'BEGIN{exit !(r<-0.05)}'; then
+      temp_cap_str="cooling"
+    fi
+  fi
+
+  power_str="$power"
+  [[ "$power" == AC* ]] && power_str="${c_green}AC ⚡${c_reset}"
+  load_str=$(read_load_avg)
+
+  # Format the data rows as plain strings; the box framing wraps them.
+  local batt_line temp_line power_line
+  batt_line=$(printf "  battery  %s  %s%3d%%%s%s   drain %-10s  ETA %s" \
+    "$batt_gauge" "$bc" "$batt" "$batt_trend" "$c_reset" "$drain_str" "$batt_eta_str")
+  temp_line=$(printf "  temp     %s  %s%4.1f°C%s%s  rate  %-12s cap %s%s" \
+    "$temp_gauge" "$tc" "$temp" "$temp_trend" "$c_reset" "$rate_str" "$temp_cap_str" "$warn_suffix")
+  power_line=$(printf "  power    %s     load  %s" "$power_str" "$load_str")
+
+  local title_row
+  title_row="  ${c_bold}provigil${c_reset}   mode ${c_bold}${MODE}${c_reset}  ·  uptime ${c_bold}$(fmt_uptime "$up")${c_reset}"
+  local foot_row="  ${c_dim}Ctrl+C to restore${c_reset}   ·   exits at battery ≤${MIN_BATTERY}%   ·   temp ≥${MAX_TEMP_C}°C"
+
+  tput cup 0 0 2>/dev/null
+  hrule '┌' '┐'
+  row "$title_row"
+  hrule '├' '┤'
+  row ""
+  row "$batt_line"
+  emit_spark_block "$bc" "$batt_spark_block"
+  row ""
+  row "$temp_line"
+  emit_spark_block "$tc" "$temp_spark_block"
+  row ""
+  row "$power_line"
+  hrule '├' '┤'
+  row "$foot_row"
+  hrule '└' '┘'
+  tput ed 2>/dev/null
+}
+
+# Emit a multi-line sparkline block as box rows, indented to the data column
+# and tinted with the supplied color.
+emit_spark_block() {  # color block
+  local color=$1 block=$2 line
+  while IFS= read -r line; do
+    row "$(printf '           %s%s%s' "$color" "$line" "$c_reset")"
+  done <<< "$block"
+}
+
+# --- Box framing helpers ----------------------------------------------------
+strip_ansi() {  # writes input minus ANSI escape sequences and SI/SO controls
+  # CSI sequences (\e[...letter), plus SI (0x0F) and SO (0x0E) which macOS tput emits
+  printf '%s' "$1" | sed $'s/\033\\[[0-9;]*[a-zA-Z]//g; s/[\017\016]//g'
+}
+vlen() {  # visible (char) length, Unicode-aware (BSD awk counts bytes, so use wc -m)
+  strip_ansi "$1" | LC_ALL=en_US.UTF-8 wc -m | tr -d ' '
+}
+double_wide_extra() {  # +1 per known double-wide glyph (⚡ ⚠) in the string
+  local s=$1 extra=0 c cnt
+  for c in ⚡ ⚠; do
+    cnt=$(printf '%s' "$s" | grep -o "$c" 2>/dev/null | wc -l | tr -d ' ')
+    [[ -z "$cnt" ]] && cnt=0
+    extra=$((extra + cnt))
+  done
+  printf '%d' "$extra"
+}
+row() {  # styled content -> │ ... │ padded to BOX_W
+  local content=$1
+  local inner=$((BOX_W - 2))
+  local vis pad extra
+  vis=$(vlen "$content")
+  extra=$(double_wide_extra "$content")
+  pad=$((inner - vis - extra))
+  (( pad < 0 )) && pad=0
+  printf '│%s%*s│\n' "$content" "$pad" ''
+}
+hrule() {  # left right -- pure horizontal line, no embedded text
+  local left=$1 right=$2
+  local inner=$((BOX_W - 2))
+  printf '%s' "$left"
+  local i
+  for ((i=0; i<inner; i++)); do printf '─'; done
+  printf '%s\n' "$right"
+}
+
+# --- Decide layout based on terminal width ----------------------------------
+detect_layout() {
+  local cols
+  cols=$(tput cols 2>/dev/null || echo 80)
+  if (( cols < 72 )); then
+    NARROW=1
+  else
+    NARROW=0
+    if (( cols < 90 )); then BOX_W=$cols; else BOX_W=90; fi
+  fi
+}
+
+detect_layout
+if (( NARROW == 0 )); then
+  tput civis 2>/dev/null
+  tput clear 2>/dev/null
+fi
+
+# --- Main loop --------------------------------------------------------------
+warned_temp=0
+while kill -0 "$CAFF_PID" 2>/dev/null; do
+  batt=$(read_battery_pct)
+  temp=$(read_temp_c)
+  power=$(read_power_source)
+  now=$(date +%s)
+  up=$((now - START_TS))
+
+  if [[ -n "$batt" ]]; then push_hist BATT_HIST "$batt"; fi
+  if [[ -n "$temp" ]]; then push_hist TEMP_HIST "$temp"; fi
+  push_hist TIME_HIST "$now"
+
+  detect_layout
+  if (( NARROW )); then
+    render_narrow "${batt:-?}" "${temp:-?}" "${power:-?}" "$up"
+  else
+    render_box "${batt:-0}" "${temp:-0}" "${power:-?}" "$up"
+  fi
+
+  # Exit conditions
+  if [[ -n "$batt" && "$batt" -le "$MIN_BATTERY" ]]; then
+    EXIT_CODE=2
+    notify "provigil exiting" "Battery at ${batt}% (≤${MIN_BATTERY}%) — letting Mac sleep."
+    exit
+  fi
+
+  if [[ -n "$temp" ]]; then
+    if awk -v t="$temp" -v m="$MAX_TEMP_C" 'BEGIN{exit !(t>=m)}'; then
+      EXIT_CODE=3
+      notify "provigil exiting" "Battery temp ${temp}°C (≥${MAX_TEMP_C}°C) — letting Mac cool down."
+      exit
+    fi
+    if [[ "$warned_temp" -eq 0 ]] && awk -v t="$temp" -v w="$WARN_TEMP_C" 'BEGIN{exit !(t>=w)}'; then
+      notify "provigil warning" "Battery temp ${temp}°C (≥${WARN_TEMP_C}°C)."
+      warned_temp=1
+    fi
+    if [[ "$warned_temp" -eq 1 ]] && awk -v t="$temp" -v w="$WARN_TEMP_C" 'BEGIN{exit !(t<w-2)}'; then
+      warned_temp=0
+    fi
+  fi
+
+  sleep "$POLL_SECONDS"
+done
